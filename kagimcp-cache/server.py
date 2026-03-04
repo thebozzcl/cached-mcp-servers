@@ -603,7 +603,6 @@ async def summarize(url: str, summary_type: str = "summary") -> str:
     await metrics.record_request("kagi_summarize", response_time)
     return result
 
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
