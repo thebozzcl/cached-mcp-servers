@@ -8,6 +8,9 @@ source .venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
+# Create cache folder
+mkdir -p ~/.cache/semantic-cache/cache
+
 # Enable and start service
 systemctl --user daemon-reload
 systemctl --user enable semantic-cache
