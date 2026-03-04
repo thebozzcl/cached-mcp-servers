@@ -131,42 +131,76 @@ TOOL_FAMILIES = {
     "markdownify_url": "markdownify_url",
 }
 
-# === GLOBALS (lazy-loaded via lifespan) ===
-model: Optional[SentenceTransformer] = None
-DIMENSION: Optional[int] = None
-cache: Optional["SemanticCache"] = None
-_cleanup_timer: Optional[threading.Timer] = None
+# === CONFIGURATION CLASS (for testability) ===
+from dataclasses import dataclass
+
+@dataclass
+class SemanticCacheConfig:
+    """Configuration for semantic cache service."""
+    cache_dir: Path
+    model_name: str
+    default_threshold: float
+    max_entries: int
+    api_key: Optional[str] = None
+    max_response_length: int = 500000
+    cleanup_interval_sec: int = 3600
+    save_every_n_adds: int = 10
+    
+    @classmethod
+    def from_env(cls) -> "SemanticCacheConfig":
+        """Create configuration from environment variables."""
+        return cls(
+            cache_dir=Path(os.environ.get("CACHE_DIR", str(Path.home() / ".cache" / "semantic-cache" / "cache"))),
+            model_name=os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
+            default_threshold=float(os.environ.get("SIMILARITY_THRESHOLD", "0.92")),
+            max_entries=int(os.environ.get("MAX_ENTRIES", "10000")),
+            api_key=os.environ.get("CACHE_API_KEY", None),
+            max_response_length=int(os.environ.get("MAX_RESPONSE_LENGTH", "500000")),
+            cleanup_interval_sec=int(os.environ.get("CLEANUP_INTERVAL", "3600")),
+            save_every_n_adds=int(os.environ.get("SAVE_EVERY_N_ADDS", "10")),
+        )
 
 
-def load_model():
-    """Load the embedding model into module globals."""
-    global model, DIMENSION
-    if model is None:
-        logger.info("Loading embedding model: %s …", MODEL_NAME)
-        model = SentenceTransformer(MODEL_NAME)
-        DIMENSION = model.get_sentence_embedding_dimension()
-        logger.info("Model loaded. Embedding dimension: %d", DIMENSION)
-
-
-def get_model() -> SentenceTransformer:
-    if model is None:
-        load_model()
-    return model
-
-
-def get_dimension() -> int:
-    if DIMENSION is None:
-        load_model()
-    return DIMENSION
+# =====================================================================
+# MODEL LOADER (for testability)
+# =====================================================================
+class ModelLoader:
+    """Load and manage sentence-transformers model."""
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self._model: Optional[SentenceTransformer] = None
+        self._dimension: Optional[int] = None
+    
+    def load(self) -> SentenceTransformer:
+        """Load the embedding model. Returns cached model if already loaded."""
+        if self._model is None:
+            logger.info("Loading embedding model: %s …", self.model_name)
+            self._model = SentenceTransformer(self.model_name)
+            self._dimension = self._model.get_sentence_embedding_dimension()
+            logger.info("Model loaded. Embedding dimension: %d", self._dimension)
+        return self._model
+    
+    def get_model(self) -> SentenceTransformer:
+        """Get the loaded model. Loads if not already loaded."""
+        if self._model is None:
+            self.load()
+        return self._model
+    
+    def get_dimension(self) -> int:
+        """Get the embedding dimension. Loads model if not already loaded."""
+        if self._dimension is None:
+            self.load()
+        return self._dimension
 
 
 # =====================================================================
 # SEMANTIC CACHE
 # =====================================================================
 class SemanticCache:
-    def __init__(self):
-        dim = get_dimension()
-        self.index = faiss.IndexFlatIP(dim)
+    def __init__(self, model: SentenceTransformer, config: SemanticCacheConfig):
+        self.model = model
+        self.config = config
+        self.index = faiss.IndexFlatIP(self.model.get_sentence_embedding_dimension())
         self.entries: list[dict] = []
         # FIX: Store vectors in a parallel list so we never need
         # faiss.rev_swig_ptr / get_xb() and never re-encode on eviction.
@@ -182,8 +216,8 @@ class SemanticCache:
 
     def _load_from_disk(self):
         """Load persisted cache on startup with consistency validation."""
-        cache_file = CACHE_DIR / "semantic_cache.json"
-        vectors_file = CACHE_DIR / "semantic_vectors.npy"
+        cache_file = self.config.cache_dir / "semantic_cache.json"
+        vectors_file = self.config.cache_dir / "semantic_vectors.npy"
 
         if not (cache_file.exists() and vectors_file.exists()):
             return
@@ -203,12 +237,12 @@ class SemanticCache:
                 )
                 return
 
-            if vectors.ndim != 2 or vectors.shape[1] != get_dimension():
+            if vectors.ndim != 2 or vectors.shape[1] != self.model.get_sentence_embedding_dimension():
                 logger.warning(
                     "Vector dimension mismatch (got %s, expected %d) "
                     "— starting with empty cache",
                     vectors.shape,
-                    get_dimension(),
+                    self.model.get_sentence_embedding_dimension(),
                 )
                 return
 
@@ -232,9 +266,9 @@ class SemanticCache:
             entries_snap = list(self.entries)
             vectors_snap = list(self.vectors)
 
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        cache_file = CACHE_DIR / "semantic_cache.json"
-        vectors_file = CACHE_DIR / "semantic_vectors.npy"
+        self.config.cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = self.config.cache_dir / "semantic_cache.json"
+        vectors_file = self.config.cache_dir / "semantic_vectors.npy"
 
         try:
             with open(cache_file, "w") as f:
@@ -245,7 +279,7 @@ class SemanticCache:
             else:
                 np.save(
                     vectors_file,
-                    np.empty((0, get_dimension()), dtype=np.float32),
+                    np.empty((0, self.model.get_sentence_embedding_dimension()), dtype=np.float32),
                 )
             logger.info("Saved %d entries to disk", len(entries_snap))
         except Exception:
@@ -279,10 +313,10 @@ class SemanticCache:
         threshold: float = None,
     ) -> Optional[dict]:
         if threshold is None:
-            threshold = DEFAULT_THRESHOLD
+            threshold = self.config.default_threshold
 
         # FIX: Encode OUTSIDE the lock to avoid serializing all requests
-        query_vec = get_model().encode(
+        query_vec = self.model.encode(
             [query], normalize_embeddings=True
         ).astype(np.float32)
 
@@ -334,7 +368,7 @@ class SemanticCache:
             ttl = self.get_ttl(tool)
 
         # FIX: Encode OUTSIDE the lock
-        query_vec = get_model().encode(
+        query_vec = self.model.encode(
             [query], normalize_embeddings=True
         ).astype(np.float32)
 
@@ -361,7 +395,7 @@ class SemanticCache:
                     return
 
             # Evict if at capacity
-            if len(self.entries) >= MAX_ENTRIES:
+            if len(self.entries) >= self.config.max_entries:
                 self._evict_locked()
 
             # FIX: Wrap mutations in try/except to maintain consistency
@@ -378,7 +412,7 @@ class SemanticCache:
                 raise
 
             self._add_counter += 1
-            should_save = self._add_counter % SAVE_EVERY_N_ADDS == 0
+            should_save = self._add_counter % self.config.save_every_n_adds == 0
 
         if should_save:
             self.save_to_disk()
@@ -389,7 +423,7 @@ class SemanticCache:
 
     def _rebuild_index_locked(self):
         """Rebuild FAISS index from stored vectors. Caller MUST hold self.lock."""
-        dim = get_dimension()
+        dim = self.model.get_sentence_embedding_dimension()
         self.index = faiss.IndexFlatIP(dim)
         if self.vectors:
             self.index.add(np.stack(self.vectors).astype(np.float32))
@@ -406,7 +440,7 @@ class SemanticCache:
         ]
 
         # If still at capacity after removing expired, drop oldest 10%
-        if len(valid) >= MAX_ENTRIES:
+        if len(valid) >= self.config.max_entries:
             valid.sort(key=lambda x: x[0]["timestamp"])
             valid = valid[len(valid) // 10 :]
 
@@ -454,7 +488,7 @@ class SemanticCache:
                 "active_entries": len(self.entries) - expired,
                 "by_tool": by_tool,
                 "index_size": self.index.ntotal,
-                "max_entries": MAX_ENTRIES,
+                "max_entries": self.config.max_entries,
             }
 
     def clear(self, tool: str = None):
@@ -512,8 +546,10 @@ def _cancel_cleanup():
 async def lifespan(app: FastAPI):
     # --- Startup ---
     global cache
-    load_model()
-    cache = SemanticCache()
+    config = SemanticCacheConfig.from_env()
+    model_loader = ModelLoader(config.model_name)
+    model = model_loader.get_model()
+    cache = SemanticCache(model, config)
     _schedule_cleanup(cache)
     yield
     # --- Shutdown ---
@@ -569,8 +605,8 @@ class ClearRequest(BaseModel):
 @app.get("/health")
 def health():
     """Enhanced health check with model status and memory info."""
-    model_loaded = model is not None
-    dimension = get_dimension() if model_loaded else None
+    model_loaded = cache.model is not None
+    dimension = cache.model.get_sentence_embedding_dimension() if model_loaded else None
     
     # Get memory usage if available
     memory_info = {}
@@ -588,10 +624,10 @@ def health():
     
     return {
         "status": "ok",
-        "model": MODEL_NAME,
+        "model": cache.config.model_name,
         "model_loaded": model_loaded,
         "dimension": dimension,
-        "cache_size": cache.index.ntotal if cache else 0,
+        "cache_size": cache.index.ntotal,
         "memory": memory_info
     }
 
@@ -623,14 +659,15 @@ def search(req: SearchRequest):
     client_ip = "unknown"
     
     # Check rate limit
-    if API_KEY is None:  # No auth = stricter limits
-        rate_limit_per_minute_per_ip = int(os.environ.get("RATE_LIMIT_UNAUTH_PER_IP", "5"))
+    if API_KEY is not None:  # Auth enabled = stricter limits
+        rate_limit_per_minute_per_ip = int(os.environ.get("RATE_LIMIT_AUTH_PER_IP", "5"))
     
     # Record request
     metrics.record_request(req.tool, time.time() - start_time)
     
     # Perform search
-    result = cache.search(req.query, req.tool, req.threshold)
+    threshold = req.threshold if req.threshold is not None else cache.config.default_threshold
+    result = cache.search(req.query, req.tool, threshold)
     
     # Record cache hit/miss
     if result:
@@ -652,7 +689,7 @@ def search(req: SearchRequest):
 def add(req: AddRequest):
     """Add to cache with metrics tracking."""
     start_time = time.time()
-    cache.add(req.query, req.tool, req.response, req.ttl)
+    cache.add(req.query, req.tool, req.response, req.ttl or 0)
     response_time = time.time() - start_time
     metrics.record_request(req.tool, response_time)
     return {"status": "added", "tool": req.tool, "response_time_ms": response_time * 1000}
@@ -662,10 +699,11 @@ def add(req: AddRequest):
 def clear(req: ClearRequest):
     """Clear cache with metrics tracking."""
     start_time = time.time()
-    cache.clear(req.tool)
+    tool = req.tool or "all"
+    cache.clear(tool)
     response_time = time.time() - start_time
     metrics.record_request("clear", response_time)
-    return {"status": "cleared", "tool": req.tool or "all", "response_time_ms": response_time * 1000}
+    return {"status": "cleared", "tool": tool, "response_time_ms": response_time * 1000}
 
 
 @app.post("/save", dependencies=[Depends(verify_api_key)])
