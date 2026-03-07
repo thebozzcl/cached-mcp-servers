@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "fastapi>=0.100.0",
+#   "uvicorn>=0.23.0",
+#   "sentence-transformers>=2.2.0",
+#   "faiss-cpu>=1.7.4",
+#   "numpy>=1.24.0",
+#   "pydantic>=2.0.0",
+#   "psutil>=5.9.0",
+# ]
+# ///
 """
 Semantic Cache Service for MCP tools
 Uses FAISS for in-memory vector search + sentence-transformers for embeddings

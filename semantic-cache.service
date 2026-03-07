@@ -1,0 +1,17 @@
+[Unit]
+Description=Semantic Cache Service for MCP
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/bozz/mcp-servers/cached-mcp-servers/semantic-cache
+ExecStart=/home/bozz/.local/bin/uv run server.py
+Restart=unless-stopped
+RestartSec=5
+Environment=CACHE_DIR=/home/bozz/.cache/semantic-cache/cache
+Environment=EMBEDDING_MODEL=all-MiniLM-L6-v2
+Environment=SIMILARITY_THRESHOLD=0.75
+Environment=MAX_ENTRIES=10000
+
+[Install]
+WantedBy=default.target
